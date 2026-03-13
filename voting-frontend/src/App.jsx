@@ -56,28 +56,43 @@ function App() {
     setIsConnecting(false)
   }
 
-  // Fetch candidates from smart contract
+  // Fetch candidates from backend
   const fetchCandidates = async () => {
     try {
-      const provider = new ethers.JsonRpcProvider('http://127.0.0.1:8545')
-      const contract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, provider)
-      const count = await contract.candidatesCount()
-      const candidateList = []
-      for (let i = 1n; i <= count; i++) {
-        const c = await contract.candidates(i)
-        candidateList.push({
-          id: Number(i) - 1,
+      const response = await axios.get('http://localhost:5000/api/candidates')
+      if (response.data.success) {
+        const candidateList = response.data.candidates.map((c, index) => ({
+          id: index,
+          name: c.name,
+          party: c.party,
+          constituency: c.constituency,
+          voteCount: '0'
+        }))
+        setCandidates(candidateList)
+      }
+    } catch (error) {
+      console.error('Error fetching candidates:', error)
+      setMessage('Could not fetch candidates. Make sure the backend is running.')
+      setMessageType('error')
+    }
+  }
+
+  // Refresh vote counts and results
+  const refreshVotes = async () => {
+    try {
+      const response = await axios.get('http://localhost:5000/api/get-results')
+      if (response.data.success) {
+        const candidateList = response.data.results.map((c, index) => ({
+          id: index,
           name: c.name,
           party: c.party,
           constituency: c.constituency,
           voteCount: c.voteCount.toString()
-        })
+        }))
+        setCandidates(candidateList)
       }
-      setCandidates(candidateList)
     } catch (error) {
-      console.error('Error fetching candidates:', error)
-      setMessage('Could not fetch candidates. Make sure the contract is deployed and Hardhat is running.')
-      setMessageType('error')
+      console.error('Error refreshing votes:', error)
     }
   }
 
@@ -85,11 +100,6 @@ function App() {
   useEffect(() => {
     fetchCandidates()
   }, [])
-
-  // Refresh vote counts
-  const refreshVotes = async () => {
-    await fetchCandidates()
-  }
 
   const requestOtp = async () => {
     try {
@@ -122,7 +132,7 @@ function App() {
     }
   }
 
-  // Cast vote on blockchain
+  // Cast vote through backend and blockchain
   const castVote = async () => {
     if (selectedCandidate === null) {
       setMessage('Please select a candidate first!')
@@ -136,17 +146,38 @@ function App() {
         throw new Error('MetaMask not installed')
       }
 
+      // Get wallet address
       const provider = new ethers.BrowserProvider(window.ethereum)
       const signer = await provider.getSigner()
-      const contract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, signer)
-      
-      const tx = await contract.vote(selectedCandidate + 1)
-      setMessage('Transaction submitted! Waiting for confirmation...')
+      const address = await signer.getAddress()
+
+      // Step 1: Cast vote on backend (encrypts and stores)
+      setMessage('Encrypting and storing your vote...')
       setMessageType('success')
+
+      const backendResponse = await axios.post('http://localhost:5000/api/cast-vote', {
+        voterId: voterId,
+        walletAddress: address,
+        candidateId: selectedCandidate + 1
+      })
+
+      if (!backendResponse.data.success) {
+        throw new Error(backendResponse.data.message)
+      }
+
+      const voteHash = backendResponse.data.voteHash
+      console.log('Vote encrypted and stored. Hash:', voteHash)
+
+      // Step 2: Record vote on blockchain
+      setMessage('Recording vote on blockchain...')
       
+      const contract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, signer)
+      const tx = await contract.vote(selectedCandidate + 1)
+      
+      setMessage('Transaction submitted! Waiting for confirmation...')
       await tx.wait()
       
-      setMessage('Vote cast successfully! Your vote has been recorded on the blockchain.')
+      setMessage(`Vote cast successfully! Your vote has been securely recorded. Hash: ${voteHash.substring(0, 16)}...`)
       setMessageType('success')
       setHasVoted(true)
       
@@ -157,12 +188,14 @@ function App() {
       setSelectedCandidate(null)
     } catch (error) {
       console.error('Error casting vote:', error)
-      if (error.reason) {
+      if (error.response?.data?.message) {
+        setMessage(`Error: ${error.response.data.message}`)
+      } else if (error.reason) {
         setMessage(`Error: ${error.reason}`)
       } else if (error.message.includes('user rejected')) {
         setMessage('Transaction rejected by user.')
       } else {
-        setMessage('Error casting vote. You may have already voted or the transaction failed.')
+        setMessage('Error casting vote. ' + error.message)
       }
       setMessageType('error')
     }
